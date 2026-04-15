@@ -419,10 +419,14 @@ def load_dataset_from_jsonl(split, tight_prob=0.5, fraction=1.0):
 # ═══════════════════════════════════════════════════════════════════════
 
 def clear_gpu_memory():
-    gc.collect()
+    # Multiple rounds of gc to break circular references
+    for _ in range(3):
+        gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
         torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_accumulated_memory_stats()
         torch.cuda.synchronize()
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
@@ -430,6 +434,66 @@ def clear_gpu_memory():
             f"GPU 메모리 — allocated: {allocated:.1f}GB, "
             f"reserved: {reserved:.1f}GB | peak 초기화됨"
         )
+
+
+def _has_meta_tensors(model) -> bool:
+    """Check if any model parameter is still on the meta device."""
+    for name, param in model.named_parameters():
+        if param.device.type == "meta":
+            logger.warning(f"Meta tensor 발견: {name}")
+            return True
+    return False
+
+
+def load_model_with_retry(base_model, max_retries=2):
+    """Load model with meta-tensor validation and retry on failure.
+
+    After 27+ trials, GPU memory fragmentation can prevent full weight
+    materialisation, leaving some tensors on the meta device.  This
+    wrapper detects that situation, does an aggressive cleanup, and
+    retries the load.
+    """
+    from unsloth import FastVisionModel
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            model, tokenizer = FastVisionModel.from_pretrained(
+                base_model, load_in_4bit=False,
+                use_gradient_checkpointing="unsloth",
+            )
+            if _has_meta_tensors(model):
+                raise RuntimeError(
+                    "Model loaded but contains meta tensors — "
+                    "weights were not fully materialised"
+                )
+            return model, tokenizer
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                f"모델 로딩 시도 {attempt}/{max_retries} 실패: {e}"
+            )
+            # Aggressively free whatever was partially loaded
+            try:
+                del model
+            except UnboundLocalError:
+                pass
+            try:
+                del tokenizer
+            except UnboundLocalError:
+                pass
+            for _ in range(5):
+                gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                torch.cuda.synchronize()
+            # Brief pause to let CUDA fully reclaim memory
+            time.sleep(2)
+
+    raise RuntimeError(
+        f"모델 로딩 {max_retries}회 시도 후 실패: {last_err}"
+    ) from last_err
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -709,10 +773,7 @@ def objective(trial: optuna.Trial, args) -> float:
 
         clear_gpu_memory()
 
-        model, tokenizer = FastVisionModel.from_pretrained(
-            BASE_MODEL, load_in_4bit=False,
-            use_gradient_checkpointing="unsloth",
-        )
+        model, tokenizer = load_model_with_retry(BASE_MODEL)
 
         model = FastVisionModel.get_peft_model(
             model,
@@ -900,13 +961,25 @@ def objective(trial: optuna.Trial, args) -> float:
         raise optuna.TrialPruned()
 
     finally:
-        # Guaranteed cleanup on ALL code paths
+        # Guaranteed cleanup on ALL code paths — aggressively break
+        # all circular references to prevent GPU memory leaks across trials
         if trainer is not None:
-            trainer.data_collator = None  # Sever model reference in collator
-        # All vars pre-initialized to None, so these are always safe
+            trainer.data_collator = None
+            # Break optimizer → param references (major leak source)
+            if hasattr(trainer, "optimizer") and trainer.optimizer is not None:
+                trainer.optimizer.zero_grad(set_to_none=True)
+                for group in trainer.optimizer.param_groups:
+                    group["params"] = []
+                trainer.optimizer = None
+            if hasattr(trainer, "lr_scheduler"):
+                trainer.lr_scheduler = None
+            if hasattr(trainer, "model"):
+                trainer.model = None
+            trainer.callback_handler = None
+        if model is not None:
+            model.cpu()  # Move off GPU before deleting
         del trainer, model, tokenizer, train_dataset, val_dataset
         wandb_finish(wandb_run, exit_code=0)
-        gc.collect()
         clear_gpu_memory()
         shutil.rmtree(trial_dir, ignore_errors=True)
 
@@ -1041,10 +1114,9 @@ def retrain_best(study: optuna.Study):
         )
         val_dataset = load_dataset_from_jsonl("val")
 
-        model, tokenizer = FastVisionModel.from_pretrained(
-            BASE_MODEL, load_in_4bit=False,
-            use_gradient_checkpointing="unsloth",
-        )
+        clear_gpu_memory()
+
+        model, tokenizer = load_model_with_retry(BASE_MODEL)
 
         lora_alpha = int(p["lora_r"] * p["lora_alpha_ratio"])
         model = FastVisionModel.get_peft_model(
