@@ -558,9 +558,12 @@ def find_label_json(split, class_name, img_filename):
     json_path = os.path.join(DATA_DIR, split, class_name, img_filename + ".json")
     if not os.path.exists(json_path):
         return None
-    with open(json_path, encoding="utf-8") as f:
-        data = json.load(f)
-    for obj in data["annotations"]["object"]:
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        return None  # Empty or corrupt label file — skip bbox
+    for obj in data.get("annotations", {}).get("object", []):
         if obj["grow"] == 33 and obj.get("points"):
             return obj["points"][0]
     return None
