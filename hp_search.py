@@ -110,19 +110,21 @@ def get_max_data_fraction(n_train_samples: int) -> float:
     return max_frac
 
 SEARCH_SPACE = {
+    # NOTE: Categorical lists MUST match original — Optuna forbids changing
+    # them on an existing study. TPE will learn to avoid bad values.
     "per_device_train_batch_size": [1, 2, 4],
     "gradient_accumulation_steps": [2, 4, 8],
-    "learning_rate":              (1e-5, 1e-4),       # narrowed: best trials at 2-6e-05
+    "learning_rate":              (1e-5, 1e-4),         # narrowed (continuous OK to change)
     "num_train_epochs":           [2, 3, 5],
     "warmup_steps":               [0, 10, 50, 100],
-    "weight_decay":               (0.0, 0.05),         # narrowed: best at 0.009
-    "lr_scheduler_type":          ["cosine", "cosine_with_restarts"],
-    "max_seq_length":             [1024],              # 2048 wastes VRAM; pest labels are 2-6 tokens
-    "lora_r":                     [16, 32, 64],        # drop 8: too small per trial data
-    "lora_alpha_ratio":           [1.0, 2.0],          # drop 4.0: never optimal
+    "weight_decay":               (0.0, 0.05),          # narrowed
+    "lr_scheduler_type":          ["linear", "cosine", "cosine_with_restarts"],
+    "max_seq_length":             [1024, 2048],
+    "lora_r":                     [8, 16, 32, 64],
+    "lora_alpha_ratio":           [1.0, 2.0, 4.0],
     "finetune_vision_layers":     [True, False],
-    "use_rslora":                 [True],              # always True: best per trial data
-    "crop_tight_prob":            (0.4, 0.65),         # narrowed: best at 0.56-0.58
+    "use_rslora":                 [False, True],
+    "crop_tight_prob":            (0.4, 0.65),          # narrowed
 }
 
 _line_count_cache = {}
