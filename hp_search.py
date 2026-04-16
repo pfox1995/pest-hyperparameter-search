@@ -1109,7 +1109,10 @@ def objective(trial: optuna.Trial, args) -> float:
                 if metrics and "eval_loss" in metrics:
                     step = state.global_step
                     self._trial.report(metrics["eval_loss"], step)
-                    if self._trial.should_prune():
+                    # Don't prune on the last eval — all training work
+                    # is already done, wasting it is worse than completing.
+                    is_last_step = (step >= state.max_steps)
+                    if not is_last_step and self._trial.should_prune():
                         logger.info(f"트라이얼 {self._trial.number} 스텝 {step}에서 가지치기")
                         raise optuna.TrialPruned()
 
