@@ -125,6 +125,17 @@ SEARCH_SPACE = {
     "crop_tight_prob":            (0.3, 0.7),
 }
 
+_line_count_cache = {}
+
+
+def _get_line_count(path: str) -> int:
+    """Count lines in a file, caching the result across trials."""
+    if path not in _line_count_cache:
+        with open(path, "r") as f:
+            _line_count_cache[path] = sum(1 for _ in f)
+    return _line_count_cache[path]
+
+
 SYSTEM_MSG = (
     "당신은 작물 해충 식별 전문가입니다. "
     "사진을 보고 해충의 이름만 한국어로 답하세요. "
@@ -583,8 +594,7 @@ def load_dataset_from_jsonl(split, tight_prob=0.5, fraction=1.0):
     """
     jsonl_path = os.path.join(DATA_DIR, f"{split}.jsonl")
 
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        total_lines = sum(1 for _ in f)
+    total_lines = _get_line_count(jsonl_path)
 
     if fraction < 1.0:
         keep = set(random.sample(range(total_lines), int(total_lines * fraction)))
@@ -1010,8 +1020,7 @@ def objective(trial: optuna.Trial, args) -> float:
 
         # Cap data fraction based on available system RAM
         jsonl_path = os.path.join(DATA_DIR, "train.jsonl")
-        with open(jsonl_path, "r") as _f:
-            n_train_total = sum(1 for _ in _f)
+        n_train_total = _get_line_count(jsonl_path)
         ram_max_frac = get_max_data_fraction(n_train_total)
         if data_fraction > ram_max_frac:
             logger.info(
@@ -1447,8 +1456,7 @@ def retrain_best(study: optuna.Study):
 
         # Cap data fraction based on available RAM
         jsonl_path = os.path.join(DATA_DIR, "train.jsonl")
-        with open(jsonl_path, "r") as _f:
-            n_train_total = sum(1 for _ in _f)
+        n_train_total = _get_line_count(jsonl_path)
         retrain_frac = get_max_data_fraction(n_train_total)
         if retrain_frac < 1.0:
             logger.info(
@@ -1660,6 +1668,22 @@ def main():
         ),
         load_if_exists=True,
     )
+
+    # ─── Clean stale RUNNING trials from crashed sessions ─────────
+    # When a session is killed, trials stay RUNNING forever.  These
+    # pollute TPE sampling and waste the trial budget.  Safe to mark
+    # them FAIL here because the current process hasn't started any.
+    for t in study.trials:
+        if t.state == optuna.trial.TrialState.RUNNING:
+            study.tell(t.number, state=optuna.trial.TrialState.FAIL)
+            logger.info(f"Stale trial {t.number} (RUNNING) → FAIL")
+
+    # ─── Log study state summary ──────────────────────────────────
+    states = {}
+    for t in study.trials:
+        states[t.state.name] = states.get(t.state.name, 0) + 1
+    if states:
+        logger.info(f"Study 상태: {states}")
 
     mode = ("PROXY (10%)" if args.proxy
             else "QUICK (20%)" if args.quick
