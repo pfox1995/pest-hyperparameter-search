@@ -65,6 +65,16 @@ The fallback `eval_result` dict must include ALL keys that downstream code expec
 - `study.tell()` does NOT work for trials created by `study.optimize()` — use raw SQL
 - `_storage.set_trial_state_values()` API varies across Optuna versions — avoid it
 
+### Optuna categorical distributions are IMMUTABLE
+Once a study has trials, `suggest_categorical` choices CANNOT be changed.
+Adding or removing values causes `CategoricalDistribution does not support dynamic value space`.
+Only `suggest_float`/`suggest_int` ranges can be freely changed. Let TPE learn to avoid bad categoricals.
+
+### Enqueuing trials
+`study.enqueue_trial()` param values must match `suggest_*` names and be valid choices.
+For categoricals, pass the actual value (e.g. `"lr_scheduler": "cosine"`), not an index.
+For floats, pass the raw value (e.g. `"learning_rate": 2.88e-05`).
+
 ## Code Conventions
 
 - Korean log messages and Discord notifications (target audience is Korean)
