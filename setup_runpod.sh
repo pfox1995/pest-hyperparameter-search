@@ -141,7 +141,19 @@ fi
 # START TMUX SESSION (survives SSH disconnect)
 # ═══════════════════════════════════════════════════════════════════════
 
-echo "=== [4/5] 학습 세션 준비 중... ==="
+echo "=== [4/6] W&B에서 이전 결과 시딩 중... ==="
+
+# Seed the Optuna study with best trials from previous W&B runs
+# This ensures known-good parameters are tried first on the new pod
+if [[ -n "$WANDB_API_KEY" && "$WANDB_API_KEY" != *"REPLACE"* ]]; then
+    python3 seed_from_wandb.py --top-n 5 --add-neighbors 2>&1 | tee -a "${HP_LOG_FILE}" || {
+        echo "WARNING: W&B 시딩 실패. 새로운 검색으로 계속합니다."
+    }
+else
+    echo "W&B 키가 없어 시딩을 건너뜁니다."
+fi
+
+echo "=== [5/6] 학습 세션 준비 중... ==="
 
 # Install tmux if not available
 if ! command -v tmux &> /dev/null; then
@@ -153,8 +165,9 @@ SESSION_NAME="hp_search"
 # Kill existing session if present
 tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 
-echo "=== [5/5] 하이퍼파라미터 검색 시작! ==="
+echo "=== [6/6] 하이퍼파라미터 검색 시작! ==="
 echo ""
+echo "  Phase 0: W&B 시딩 완료 (이전 최적 파라미터 + 변형 enqueued)"
 echo "  Phase 1: Proxy 검색 (50 trials, 10% 데이터, 1 에폭)"
 echo "  Phase 2: Full 검색 (10 trials, 전체 데이터) + 최적 모델 재학습"
 echo ""
@@ -172,7 +185,7 @@ echo ""
 tmux new-session -d -s "$SESSION_NAME" bash -c "
     cd /workspace
 
-    echo '=== Phase 1: Proxy 검색 시작 ==='
+    echo '=== Phase 1: Proxy 검색 시작 (seeded trials run first) ==='
     python3 hp_search.py --proxy --n-trials 50 2>&1 | tee -a '${HP_LOG_FILE}'
     PHASE1_EXIT=\$?
 
