@@ -1673,15 +1673,24 @@ def main():
     # When a session is killed, trials stay RUNNING forever.  These
     # pollute TPE sampling and waste the trial budget.  Safe to mark
     # them FAIL here because the current process hasn't started any.
-    _storage = study._storage
-    for t in study.trials:
-        if t.state == optuna.trial.TrialState.RUNNING:
-            try:
-                _storage.set_trial_state_values(
-                    t._trial_id, state=optuna.trial.TrialState.FAIL)
-                logger.info(f"Stale trial {t.number} (RUNNING) -> FAIL")
-            except Exception as e:
-                logger.warning(f"Stale trial {t.number} cleanup failed: {e}")
+    # Use raw SQL because Optuna's Python API varies across versions.
+    import sqlite3
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            "UPDATE trials SET state = 'FAIL' WHERE state = 'RUNNING'"
+        )
+        if cur.rowcount > 0:
+            conn.commit()
+            logger.info(f"Stale RUNNING trials -> FAIL: {cur.rowcount}건")
+        conn.close()
+        # Reload study to pick up the state changes
+        study = optuna.load_study(
+            study_name=STUDY_NAME, storage=STORAGE_DB,
+            sampler=study.sampler, pruner=study.pruner,
+        )
+    except Exception as e:
+        logger.warning(f"Stale trial cleanup failed: {e}")
 
     # ─── Log study state summary ──────────────────────────────────
     states = {}
