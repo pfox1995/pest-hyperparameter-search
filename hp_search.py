@@ -1035,17 +1035,18 @@ def objective(trial: optuna.Trial, args) -> float:
             )
 
         # ─── VRAM budget check (A6000 = 48GB) ─────────────────────────
-        # Rough estimate: base model ~18GB, LoRA + optimizer ~12GB,
-        # activations scale with batch_size * max_seq.  If the combo
-        # is likely to OOM, prune early instead of corrupting CUDA state.
+        # Rough estimate with gradient checkpointing (Unsloth default):
+        #   - Base model bf16 weights: ~18GB
+        #   - adamw_8bit optimizer on LoRA params: ~5GB
+        #   - Activations w/ grad ckpt: ~2.5GB per batch element at seq=1024
+        #   - Vision layer finetuning overhead: ~3GB
+        # lora_r does NOT scale activations (only adapter weight size, <1GB)
         if torch.cuda.is_available():
             total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            # vision layers add ~4GB overhead when finetuned
-            vision_overhead = 4.0 if ft_vision else 0.0
-            # Higher lora_r and larger batch increase activation memory
-            activation_est = batch_size * (max_seq / 1024) * (lora_r / 32) * 3.0
-            estimated_gb = 18.0 + 12.0 + vision_overhead + activation_est
-            if estimated_gb > total_vram_gb * 0.95:
+            vision_overhead = 3.0 if ft_vision else 0.0
+            activation_est = batch_size * (max_seq / 1024) * 2.5
+            estimated_gb = 18.0 + 5.0 + vision_overhead + activation_est
+            if estimated_gb > total_vram_gb * 0.92:
                 logger.warning(
                     f"트라이얼 {trial.number} VRAM 예산 초과 예측: "
                     f"{estimated_gb:.1f}GB > {total_vram_gb:.1f}GB — 가지치기"
