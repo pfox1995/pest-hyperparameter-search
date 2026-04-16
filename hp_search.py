@@ -46,6 +46,11 @@ from optuna.samplers import TPESampler
 import torch
 from PIL import Image
 
+# TF32 precision on Ampere GPUs — accelerates remaining FP32 ops (optimizer, loss)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
 # Suppress DecompressionBombWarning for large pest images
 # and prevent OOM by capping max image size
 Image.MAX_IMAGE_PIXELS = None
@@ -772,7 +777,7 @@ def evaluate_model(model, tokenizer, val_dataset, max_samples=200,
 
             with torch.no_grad():
                 output_ids = model.generate(
-                    **inputs, max_new_tokens=20,
+                    **inputs, max_new_tokens=10,
                     use_cache=True,
                 )
 
@@ -1120,6 +1125,8 @@ def objective(trial: optuna.Trial, args) -> float:
                 lr_scheduler_type=scheduler,
                 max_grad_norm=1.0,
                 dataloader_num_workers=0,
+                dataloader_pin_memory=True,
+                bf16_full_eval=True,
                 seed=RANDOM_SEED,
                 output_dir=trial_dir,
                 report_to=report_to,
@@ -1142,18 +1149,37 @@ def objective(trial: optuna.Trial, args) -> float:
         if math.isnan(train_loss) or math.isnan(eval_loss):
             raise ValueError(f"NaN detected: train={train_loss}, eval={eval_loss}")
 
-        # ─── Full evaluation (every trial) ────────────────────────────
+        # ─── Full evaluation ──────────────────────────────────────────
+        # In proxy mode, only run the expensive inference eval if this
+        # trial beats or ties the current best eval_loss.  The trainer's
+        # eval_loss is sufficient for ranking; accuracy eval confirms.
+        try:
+            current_best = trial.study.best_value
+            is_promising = (eval_loss <= current_best * 1.05)
+        except ValueError:
+            is_promising = True  # First completed trial
 
-        FastVisionModel.for_inference(model)
-        eval_samples = 100 if args.proxy else 200 if args.quick else 400
-        eval_save_dir = os.path.join(OUTPUT_BASE, "evaluations")
+        if args.proxy and not is_promising:
+            # Skip expensive inference — use eval_loss only
+            eval_result = {
+                "accuracy": 0, "f1_macro": 0, "f1_weighted": 0,
+                "precision_macro": 0, "recall_macro": 0, "total": 0,
+            }
+            logger.info(
+                f"트라이얼 {trial.number} — eval_loss {eval_loss:.4f} > "
+                f"best*1.05 ({current_best*1.05:.4f}), 정밀 평가 건너뜀"
+            )
+        else:
+            FastVisionModel.for_inference(model)
+            eval_samples = 50 if args.proxy else 200 if args.quick else 400
+            eval_save_dir = os.path.join(OUTPUT_BASE, "evaluations")
 
-        eval_result = evaluate_model(
-            model, tokenizer, val_dataset,
-            max_samples=eval_samples,
-            save_dir=eval_save_dir,
-            trial_num=trial.number,
-        )
+            eval_result = evaluate_model(
+                model, tokenizer, val_dataset,
+                max_samples=eval_samples,
+                save_dir=eval_save_dir,
+                trial_num=trial.number,
+            )
 
         accuracy = eval_result["accuracy"]
         f1_macro = eval_result["f1_macro"]
@@ -1479,6 +1505,8 @@ def retrain_best(study: optuna.Study):
                 lr_scheduler_type=p["lr_scheduler"],
                 max_grad_norm=1.0,
                 dataloader_num_workers=0,
+                dataloader_pin_memory=True,
+                bf16_full_eval=True,
                 seed=RANDOM_SEED,
                 output_dir=BEST_MODEL_DIR,
                 report_to=report_to,
