@@ -118,7 +118,7 @@ SEARCH_SPACE = {
     "num_train_epochs":           [2, 3, 5],
     "warmup_steps":               [0, 10, 50, 100],
     "weight_decay":               (0.0, 0.05),
-    "lr_scheduler_type":          ["cosine", "cosine_with_restarts"],
+    "lr_scheduler_type":          ["linear", "cosine", "cosine_with_restarts"],
     "max_seq_length":             [1024],               # 2048 wastes VRAM; pest labels 2-6 tokens
     "lora_r":                     [16, 32, 64],         # drop 8: too small for 9B VLM
     "lora_alpha_ratio":           [1.0, 2.0],           # drop 4.0: unstable at high r
