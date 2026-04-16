@@ -142,6 +142,9 @@ pip install \
     "seaborn>=0.13" \
     "hf_transfer>=0.1"
 
+# Flash Attention 2 — 1.5-2x faster training on Ampere+ GPUs (A6000, A100, H100)
+pip install flash-attn --no-build-isolation 2>&1 | tail -3 || echo "WARNING: Flash Attention 2 설치 실패 (xformers 대체 사용)"
+
 # Enable Rust-based parallel download accelerator for HuggingFace (3-5x faster)
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
