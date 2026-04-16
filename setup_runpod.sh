@@ -171,6 +171,16 @@ if [ ! -f "${HP_DATA_DIR}/train.jsonl" ]; then
     exit 1
 fi
 
+# Pre-download the base model so Trial 0 doesn't waste time on it
+echo "=== [3b/7] 모델 사전 다운로드 (Qwen3.5-9B)... ==="
+python3 -c "
+from huggingface_hub import snapshot_download
+import os
+os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '1')
+path = snapshot_download('unsloth/Qwen3.5-9B', ignore_patterns=['*.gguf'])
+print(f'Model cached at: {path}')
+" 2>&1 | tail -5 || echo "WARNING: 모델 사전 다운로드 실패 (첫 트라이얼에서 다운로드됨)"
+
 # ═══════════════════════════════════════════════════════════════════════
 # SEED FROM W&B
 # ═══════════════════════════════════════════════════════════════════════
