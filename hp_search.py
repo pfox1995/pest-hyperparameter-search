@@ -1654,6 +1654,25 @@ def main():
         wandb_log_best_summary(study)
         return
 
+    # ─── Clean stale RUNNING trials BEFORE Optuna opens the DB ──────
+    # When a session is killed, trials stay RUNNING forever.  These
+    # pollute TPE sampling and waste the trial budget.  Must run
+    # before create_study() so Optuna's cache never sees stale rows.
+    import sqlite3
+    if os.path.exists(DB_PATH):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.execute(
+                "UPDATE trials SET state = 'FAIL' WHERE state = 'RUNNING'"
+            )
+            if cur.rowcount > 0:
+                conn.commit()
+                logger.info(
+                    f"Stale RUNNING trials -> FAIL: {cur.rowcount}건 정리됨")
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Stale trial cleanup failed: {e}")
+
     # ─── Create / load study ──────────────────────────────────────────
 
     study = optuna.create_study(
@@ -1668,29 +1687,6 @@ def main():
         ),
         load_if_exists=True,
     )
-
-    # ─── Clean stale RUNNING trials from crashed sessions ─────────
-    # When a session is killed, trials stay RUNNING forever.  These
-    # pollute TPE sampling and waste the trial budget.  Safe to mark
-    # them FAIL here because the current process hasn't started any.
-    # Use raw SQL because Optuna's Python API varies across versions.
-    import sqlite3
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute(
-            "UPDATE trials SET state = 'FAIL' WHERE state = 'RUNNING'"
-        )
-        if cur.rowcount > 0:
-            conn.commit()
-            logger.info(f"Stale RUNNING trials -> FAIL: {cur.rowcount}건")
-        conn.close()
-        # Reload study to pick up the state changes
-        study = optuna.load_study(
-            study_name=STUDY_NAME, storage=STORAGE_DB,
-            sampler=study.sampler, pruner=study.pruner,
-        )
-    except Exception as e:
-        logger.warning(f"Stale trial cleanup failed: {e}")
 
     # ─── Log study state summary ──────────────────────────────────
     states = {}
