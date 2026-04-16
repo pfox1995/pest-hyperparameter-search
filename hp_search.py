@@ -1673,10 +1673,15 @@ def main():
     # When a session is killed, trials stay RUNNING forever.  These
     # pollute TPE sampling and waste the trial budget.  Safe to mark
     # them FAIL here because the current process hasn't started any.
+    _storage = study._storage
     for t in study.trials:
         if t.state == optuna.trial.TrialState.RUNNING:
-            study.tell(t.number, state=optuna.trial.TrialState.FAIL)
-            logger.info(f"Stale trial {t.number} (RUNNING) → FAIL")
+            try:
+                _storage.set_trial_state_values(
+                    t._trial_id, state=optuna.trial.TrialState.FAIL)
+                logger.info(f"Stale trial {t.number} (RUNNING) -> FAIL")
+            except Exception as e:
+                logger.warning(f"Stale trial {t.number} cleanup failed: {e}")
 
     # ─── Log study state summary ──────────────────────────────────
     states = {}
