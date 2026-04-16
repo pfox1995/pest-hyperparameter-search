@@ -112,17 +112,17 @@ def get_max_data_fraction(n_train_samples: int) -> float:
 SEARCH_SPACE = {
     "per_device_train_batch_size": [1, 2, 4],
     "gradient_accumulation_steps": [2, 4, 8],
-    "learning_rate":              (5e-6, 5e-4),      # raised floor: <5e-6 causes NaN
+    "learning_rate":              (1e-5, 1e-4),       # narrowed: best trials at 2-6e-05
     "num_train_epochs":           [2, 3, 5],
     "warmup_steps":               [0, 10, 50, 100],
-    "weight_decay":               (0.0, 0.1),
-    "lr_scheduler_type":          ["linear", "cosine", "cosine_with_restarts"],
-    "max_seq_length":             [1024, 2048],
-    "lora_r":                     [8, 16, 32, 64],    # removed 4: too small for 9B
-    "lora_alpha_ratio":           [1.0, 2.0, 4.0],    # removed 0.5: causes NaN with low r
+    "weight_decay":               (0.0, 0.05),         # narrowed: best at 0.009
+    "lr_scheduler_type":          ["cosine", "cosine_with_restarts"],
+    "max_seq_length":             [1024],              # 2048 wastes VRAM; pest labels are 2-6 tokens
+    "lora_r":                     [16, 32, 64],        # drop 8: too small per trial data
+    "lora_alpha_ratio":           [1.0, 2.0],          # drop 4.0: never optimal
     "finetune_vision_layers":     [True, False],
-    "use_rslora":                 [False, True],
-    "crop_tight_prob":            (0.3, 0.7),
+    "use_rslora":                 [True],              # always True: best per trial data
+    "crop_tight_prob":            (0.4, 0.65),         # narrowed: best at 0.56-0.58
 }
 
 _line_count_cache = {}
