@@ -336,8 +336,13 @@ def github_upload_db(reason: str = ""):
             }
 
             # Get current file SHA (required for updates)
-            resp = _req.get(url, headers=headers, timeout=15)
-            sha = resp.json().get("sha") if resp.status_code == 200 else None
+            sha = None
+            try:
+                resp = _req.get(url, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    sha = resp.json().get("sha")
+            except Exception:
+                pass  # File doesn't exist yet or API error — create new
 
             timestamp = _kst_now()
             message = f"Update Optuna DB ({timestamp} KST)"
