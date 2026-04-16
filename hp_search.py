@@ -110,21 +110,21 @@ def get_max_data_fraction(n_train_samples: int) -> float:
     return max_frac
 
 SEARCH_SPACE = {
-    # NOTE: Categorical lists MUST match original — Optuna forbids changing
-    # them on an existing study. TPE will learn to avoid bad values.
+    # Tightened based on 30-trial analysis + Unsloth/Qwen research.
+    # Fresh DB required when changing categorical lists.
     "per_device_train_batch_size": [1, 2, 4],
     "gradient_accumulation_steps": [2, 4, 8],
-    "learning_rate":              (1e-5, 1e-4),         # narrowed (continuous OK to change)
+    "learning_rate":              (1e-5, 2e-4),         # Unsloth recommends 2e-4 start
     "num_train_epochs":           [2, 3, 5],
     "warmup_steps":               [0, 10, 50, 100],
-    "weight_decay":               (0.0, 0.05),          # narrowed
-    "lr_scheduler_type":          ["linear", "cosine", "cosine_with_restarts"],
-    "max_seq_length":             [1024, 2048],
-    "lora_r":                     [8, 16, 32, 64],
-    "lora_alpha_ratio":           [1.0, 2.0, 4.0],
+    "weight_decay":               (0.0, 0.05),
+    "lr_scheduler_type":          ["cosine", "cosine_with_restarts"],
+    "max_seq_length":             [1024],               # 2048 wastes VRAM; pest labels 2-6 tokens
+    "lora_r":                     [16, 32, 64],         # drop 8: too small for 9B VLM
+    "lora_alpha_ratio":           [1.0, 2.0],           # drop 4.0: unstable at high r
     "finetune_vision_layers":     [True, False],
-    "use_rslora":                 [False, True],
-    "crop_tight_prob":            (0.4, 0.65),          # narrowed
+    "use_rslora":                 [True],               # always best per data + research
+    "crop_tight_prob":            (0.4, 0.65),
 }
 
 _line_count_cache = {}
@@ -1683,16 +1683,23 @@ def main():
 
     # ─── Create / load study ──────────────────────────────────────────
 
+    # In proxy mode (1 epoch), there's only 1 eval point — pruning is
+    # counterproductive. Use NopPruner to let every trial complete.
+    if args.proxy:
+        pruner = optuna.pruners.NopPruner()
+    else:
+        pruner = HyperbandPruner(
+            min_resource=1, max_resource=5, reduction_factor=3,
+        )
+
     study = optuna.create_study(
         study_name=STUDY_NAME,
         storage=STORAGE_DB,
         direction="minimize",
         sampler=TPESampler(
-            seed=RANDOM_SEED, n_startup_trials=5, multivariate=True,
+            seed=RANDOM_SEED, n_startup_trials=3, multivariate=True,
         ),
-        pruner=HyperbandPruner(
-            min_resource=1, max_resource=5, reduction_factor=3,
-        ),
+        pruner=pruner,
         load_if_exists=True,
     )
 
