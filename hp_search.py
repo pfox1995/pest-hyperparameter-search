@@ -81,6 +81,29 @@ QUICK_EPOCHS        = 1
 PROXY_DATA_FRACTION = 0.1
 PROXY_EPOCHS        = 1
 
+# RAM-aware data fraction cap
+# Each 1024x1024 RGB image ≈ 3MB in memory.  Reserve ~15GB for
+# model loading (temp CPU copy), val set, Python, and OS overhead.
+_RAM_RESERVE_GB = 15.0
+_BYTES_PER_IMAGE = 3.0 * 1024**2  # ~3MB per image
+
+
+def get_max_data_fraction(n_train_samples: int) -> float:
+    """Compute the max data fraction that fits in available RAM."""
+    try:
+        mem = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        total_ram_gb = mem / 1024**3
+    except (ValueError, OSError):
+        return 1.0  # Can't detect, assume unlimited
+
+    usable_gb = total_ram_gb - _RAM_RESERVE_GB
+    if usable_gb <= 0:
+        return 0.1
+
+    max_images = int(usable_gb * 1024**3 / _BYTES_PER_IMAGE)
+    max_frac = min(1.0, max_images / max(1, n_train_samples))
+    return max_frac
+
 SEARCH_SPACE = {
     "per_device_train_batch_size": [1, 2, 4],
     "gradient_accumulation_steps": [2, 4, 8],
@@ -975,6 +998,18 @@ def objective(trial: optuna.Trial, args) -> float:
         else:
             data_fraction = 1.0
 
+        # Cap data fraction based on available system RAM
+        jsonl_path = os.path.join(DATA_DIR, "train.jsonl")
+        with open(jsonl_path, "r") as _f:
+            n_train_total = sum(1 for _ in _f)
+        ram_max_frac = get_max_data_fraction(n_train_total)
+        if data_fraction > ram_max_frac:
+            logger.info(
+                f"RAM 제한: data_fraction {data_fraction:.0%} → "
+                f"{ram_max_frac:.0%} ({n_train_total}개 샘플 기준)"
+            )
+            data_fraction = ram_max_frac
+
         # Per-trial seed: each trial sees different data subset + crops
         random.seed(RANDOM_SEED + trial.number)
 
@@ -1375,8 +1410,21 @@ def retrain_best(study: optuna.Study):
 
     try:
         random.seed(RANDOM_SEED)
+
+        # Cap data fraction based on available RAM
+        jsonl_path = os.path.join(DATA_DIR, "train.jsonl")
+        with open(jsonl_path, "r") as _f:
+            n_train_total = sum(1 for _ in _f)
+        retrain_frac = get_max_data_fraction(n_train_total)
+        if retrain_frac < 1.0:
+            logger.info(
+                f"RAM 제한: retrain data_fraction 100% → "
+                f"{retrain_frac:.0%} ({n_train_total}개 샘플 기준)"
+            )
+
         train_dataset = load_dataset_from_jsonl(
             "train", tight_prob=p["crop_tight_prob"],
+            fraction=retrain_frac,
         )
         val_dataset = load_dataset_from_jsonl("val")
 
