@@ -28,7 +28,7 @@ STUDY_NAME   = "pest-detection-hpsearch"
 RANDOM_SEED  = 42
 
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "pest-detection-hpsearch")
-WANDB_ENTITY  = os.environ.get("WANDB_ENTITY", "pfox1995-none")
+WANDB_ENTITY  = os.environ.get("WANDB_ENTITY") or "pfox1995-none"
 
 # Valid values for categorical params (must match SEARCH_SPACE in hp_search.py)
 VALID_CATEGORICALS = {

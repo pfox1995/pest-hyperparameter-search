@@ -72,6 +72,10 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 WANDB_PROJECT       = os.environ.get("WANDB_PROJECT", "pest-detection-hpsearch")
 WANDB_ENTITY        = os.environ.get("WANDB_ENTITY", "")
 
+# GitHub backup — upload Optuna DB on new best trial
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN") or os.environ.get("github_pat", "")
+GITHUB_REPO  = os.environ.get("GITHUB_REPO", "pfox1995/pest-hyperparameter-search")
+
 QUICK_DATA_FRACTION = 0.2
 QUICK_EPOCHS        = 1
 PROXY_DATA_FRACTION = 0.1
@@ -280,6 +284,201 @@ def wandb_log_best_summary(study):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 3b. GITHUB DB BACKUP
+# ═══════════════════════════════════════════════════════════════════════
+
+def github_upload_db(reason: str = ""):
+    """Upload the Optuna SQLite DB to GitHub for backup.
+
+    Uses the GitHub Contents API (PUT) which creates or updates a file.
+    Runs in a background thread to avoid blocking training.
+    """
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return
+    if not os.path.exists(DB_PATH):
+        return
+
+    def _upload():
+        import base64
+        import requests as _req
+
+        try:
+            with open(DB_PATH, "rb") as f:
+                content = base64.b64encode(f.read()).decode()
+
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/hp_search_results.db"
+            headers = {
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+
+            # Get current file SHA (required for updates)
+            resp = _req.get(url, headers=headers, timeout=15)
+            sha = resp.json().get("sha") if resp.status_code == 200 else None
+
+            timestamp = _kst_now()
+            message = f"Update Optuna DB ({timestamp} KST)"
+            if reason:
+                message += f" — {reason}"
+
+            payload = {"message": message, "content": content}
+            if sha:
+                payload["sha"] = sha
+
+            resp = _req.put(url, json=payload, headers=headers, timeout=30)
+            if resp.status_code in (200, 201):
+                logger.info(f"Optuna DB → GitHub 업로드 완료 ({reason})")
+            else:
+                logger.warning(
+                    f"GitHub 업로드 실패: {resp.status_code} {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"GitHub 업로드 오류: {e}")
+
+    threading.Thread(target=_upload, daemon=True).start()
+
+
+def github_create_release(tag: str, name: str, body: str, files: dict):
+    """Create a GitHub Release and upload assets (LoRA adapter, eval, etc.).
+
+    Args:
+        tag:   Release tag, e.g. "run-20260416"
+        name:  Release title
+        body:  Release description (markdown)
+        files: Dict of {display_name: local_path} to upload as assets.
+               Directories are automatically tar.gz'd before upload.
+    """
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        logger.warning("GitHub 토큰 또는 레포가 설정되지 않아 릴리스를 건너뜁니다.")
+        return None
+    import requests as _req
+    import tarfile
+    import tempfile
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    api = f"https://api.github.com/repos/{GITHUB_REPO}"
+
+    # ─── Create release ──────────────────────────────────────────────
+    logger.info(f"GitHub 릴리스 생성 중: {tag}")
+    resp = _req.post(f"{api}/releases", headers=headers, json={
+        "tag_name": tag,
+        "name": name,
+        "body": body,
+        "draft": False,
+    }, timeout=30)
+
+    if resp.status_code == 422:
+        # Tag already exists — find and update the existing release
+        logger.info(f"태그 {tag} 이미 존재, 기존 릴리스에 에셋 추가")
+        resp = _req.get(f"{api}/releases/tags/{tag}", headers=headers, timeout=15)
+        if resp.status_code != 200:
+            logger.warning(f"기존 릴리스 조회 실패: {resp.status_code}")
+            return None
+        release = resp.json()
+        # Delete old assets to replace them
+        for asset in release.get("assets", []):
+            _req.delete(asset["url"], headers=headers, timeout=15)
+    elif resp.status_code == 201:
+        release = resp.json()
+    else:
+        logger.warning(f"릴리스 생성 실패: {resp.status_code} {resp.text[:300]}")
+        return None
+
+    upload_url = release["upload_url"].replace("{?name,label}", "")
+
+    # ─── Upload assets ───────────────────────────────────────────────
+    for display_name, local_path in files.items():
+        if not os.path.exists(local_path):
+            logger.warning(f"에셋 없음, 건너뜀: {local_path}")
+            continue
+
+        # Tar.gz directories before upload
+        if os.path.isdir(local_path):
+            tmp_tar = os.path.join(
+                tempfile.gettempdir(), f"{display_name}.tar.gz"
+            )
+            logger.info(f"압축 중: {local_path} → {tmp_tar}")
+            with tarfile.open(tmp_tar, "w:gz") as tar:
+                tar.add(local_path, arcname=os.path.basename(local_path))
+            local_path = tmp_tar
+            display_name = f"{display_name}.tar.gz"
+
+        file_size = os.path.getsize(local_path) / 1024**2
+        logger.info(f"업로드 중: {display_name} ({file_size:.1f}MB)")
+
+        with open(local_path, "rb") as f:
+            resp = _req.post(
+                f"{upload_url}?name={display_name}",
+                headers={
+                    "Authorization": f"token {GITHUB_TOKEN}",
+                    "Content-Type": "application/octet-stream",
+                },
+                data=f,
+                timeout=300,
+            )
+        if resp.status_code == 201:
+            logger.info(f"  ✓ {display_name}")
+        else:
+            logger.warning(f"  ✗ {display_name}: {resp.status_code}")
+
+    release_url = release.get("html_url", "")
+    logger.info(f"GitHub 릴리스 완료: {release_url}")
+    return release_url
+
+
+def github_upload_results(eval_result=None):
+    """Upload best model, evaluation, and HP search results as a GitHub Release."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return
+
+    timestamp = datetime.now(KST).strftime("%Y%m%d-%H%M")
+    tag = f"run-{timestamp}"
+
+    # Build release body
+    body_parts = [f"## HP Search Results — {_kst_now()} KST\n"]
+    if eval_result:
+        body_parts.append(
+            f"- **Accuracy**: {eval_result.get('accuracy', 0):.4f}\n"
+            f"- **F1 (macro)**: {eval_result.get('f1_macro', 0):.4f}\n"
+            f"- **F1 (weighted)**: {eval_result.get('f1_weighted', 0):.4f}\n"
+            f"- **Precision**: {eval_result.get('precision_macro', 0):.4f}\n"
+            f"- **Recall**: {eval_result.get('recall_macro', 0):.4f}\n"
+        )
+    body_parts.append(f"\nModel: `{BASE_MODEL}` + LoRA\n")
+
+    # Collect files to upload
+    files = {}
+    lora_path = os.path.join(BEST_MODEL_DIR, "lora")
+    if os.path.isdir(lora_path):
+        files["lora-adapter"] = lora_path
+
+    eval_dir = os.path.join(BEST_MODEL_DIR, "evaluation")
+    if os.path.isdir(eval_dir):
+        files["evaluation"] = eval_dir
+
+    results_json = os.path.join(OUTPUT_BASE, "hp_search_results.json")
+    if os.path.isfile(results_json):
+        files["hp_search_results.json"] = results_json
+
+    if os.path.exists(DB_PATH):
+        files["hp_search_results.db"] = DB_PATH
+
+    if not files:
+        logger.warning("업로드할 파일이 없습니다.")
+        return
+
+    return github_create_release(
+        tag=tag,
+        name=f"HP Search {_kst_now()} KST",
+        body="".join(body_parts),
+        files=files,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 4. DATA LOADING
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -292,6 +491,9 @@ def crop_to_bbox(img, bbox, padding_ratio=0.0):
     y1 = max(0, ytl - pad_y)
     x2 = min(img.width, xbr + pad_x)
     y2 = min(img.height, ybr + pad_y)
+    # Guard against degenerate bboxes that produce zero-size crops
+    if x2 <= x1 or y2 <= y1:
+        return img
     return img.crop((x1, y1, x2, y2))
 
 
@@ -302,7 +504,7 @@ def cap_image_size(img):
     if max(w, h) <= MAX_IMAGE_DIM:
         return img
     scale = MAX_IMAGE_DIM / max(w, h)
-    new_w, new_h = int(w * scale), int(h * scale)
+    new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
     resized = img.resize((new_w, new_h), Image.LANCZOS)
     img.close()  # Free the original large image
     return resized
@@ -543,13 +745,16 @@ def evaluate_model(model, tokenizer, val_dataset, max_samples=200,
             with torch.no_grad():
                 output_ids = model.generate(
                     **inputs, max_new_tokens=20,
-                    temperature=0.1, use_cache=True,
+                    use_cache=True,
                 )
 
             generated = tokenizer.decode(
                 output_ids[0][inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True
             ).strip()
+
+            # Free CUDA tensors immediately to prevent GPU memory accumulation
+            del inputs, output_ids
 
             y_true.append(ground_truth)
             y_pred.append(generated)
@@ -562,6 +767,10 @@ def evaluate_model(model, tokenizer, val_dataset, max_samples=200,
         except Exception as e:
             logger.warning(f"추론 오류: {e}")
             continue
+
+    # Free any remaining CUDA cache from inference loop
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if len(y_true) == 0:
         return {"accuracy": 0, "f1_macro": 0, "f1_weighted": 0,
@@ -616,10 +825,17 @@ def evaluate_model(model, tokenizer, val_dataset, max_samples=200,
             import numpy as np
 
             # Try to use a Korean-capable font
-            korean_fonts = [f for f in font_manager.findSystemFonts()
-                          if any(k in f.lower() for k in
-                                 ["nanum", "malgun", "gothic", "gulim",
-                                  "noto", "cjk"])]
+            _korean_keywords = ["nanum", "malgun", "gothic", "gulim",
+                                "noto", "cjk"]
+            def _find_korean_font():
+                return [f for f in font_manager.findSystemFonts()
+                        if any(k in f.lower() for k in _korean_keywords)]
+
+            korean_fonts = _find_korean_font()
+            if not korean_fonts:
+                # Font may have been installed after matplotlib cached its list
+                font_manager._load_fontmanager(try_read_cache=False)
+                korean_fonts = _find_korean_font()
             if korean_fonts:
                 plt.rcParams["font.family"] = font_manager.FontProperties(
                     fname=korean_fonts[0]).get_name()
@@ -701,6 +917,7 @@ def objective(trial: optuna.Trial, args) -> float:
     model, tokenizer, trainer = None, None, None
     wandb_run = None
     train_dataset, val_dataset = None, None
+    _wandb_exit_code = 0
 
     try:
         # ─── Sample hyperparameters ───────────────────────────────────
@@ -764,10 +981,45 @@ def objective(trial: optuna.Trial, args) -> float:
         train_dataset = load_dataset_from_jsonl(
             "train", tight_prob=tight_prob, fraction=data_fraction,
         )
+        # Use a fixed seed for val so every trial sees identical prompts/ordering
+        random.seed(RANDOM_SEED)
         val_dataset = load_dataset_from_jsonl(
             "val", tight_prob=0.5, fraction=1.0,
         )
         logger.info(f"데이터 로딩 완료 — train: {len(train_dataset)}, val: {len(val_dataset)}")
+
+        # ─── Clamp warmup to avoid exceeding total training steps ─────
+        steps_per_epoch = math.ceil(len(train_dataset) / (batch_size * grad_accum))
+        total_steps = steps_per_epoch * num_epochs
+        if warmup > total_steps // 2:
+            old_warmup = warmup
+            warmup = max(0, total_steps // 4)
+            logger.info(
+                f"warmup {old_warmup} -> {warmup} (총 스텝 {total_steps}의 "
+                f"절반 초과하여 자동 조정)"
+            )
+
+        # ─── VRAM budget check (A6000 = 48GB) ─────────────────────────
+        # Rough estimate: base model ~18GB, LoRA + optimizer ~12GB,
+        # activations scale with batch_size * max_seq.  If the combo
+        # is likely to OOM, prune early instead of corrupting CUDA state.
+        if torch.cuda.is_available():
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            # vision layers add ~4GB overhead when finetuned
+            vision_overhead = 4.0 if ft_vision else 0.0
+            # Higher lora_r and larger batch increase activation memory
+            activation_est = batch_size * (max_seq / 1024) * (lora_r / 32) * 3.0
+            estimated_gb = 18.0 + 12.0 + vision_overhead + activation_est
+            if estimated_gb > total_vram_gb * 0.95:
+                logger.warning(
+                    f"트라이얼 {trial.number} VRAM 예산 초과 예측: "
+                    f"{estimated_gb:.1f}GB > {total_vram_gb:.1f}GB — 가지치기"
+                )
+                discord_trial_pruned(trial.number,
+                    f"VRAM 예산 초과 예측: {estimated_gb:.1f}GB "
+                    f"(batch={batch_size}, seq={max_seq}, r={lora_r}, "
+                    f"vision={ft_vision})")
+                raise optuna.TrialPruned()
 
         # ─── Load model + LoRA ────────────────────────────────────────
 
@@ -825,6 +1077,8 @@ def objective(trial: optuna.Trial, args) -> float:
                 optim="adamw_8bit",
                 weight_decay=wd,
                 lr_scheduler_type=scheduler,
+                max_grad_norm=1.0,
+                dataloader_num_workers=0,
                 seed=RANDOM_SEED,
                 output_dir=trial_dir,
                 report_to=report_to,
@@ -927,6 +1181,13 @@ def objective(trial: optuna.Trial, args) -> float:
             eval_metrics=eval_result,
         )
 
+        # ─── GitHub DB backup on new best ─────────────────────────────
+        if is_best:
+            github_upload_db(
+                f"trial {trial.number}: eval_loss={eval_loss:.6f}, "
+                f"acc={accuracy:.4f}"
+            )
+
         # ─── Return objective ─────────────────────────────────────────
 
         # Guard against NaN — Optuna crashes if it receives NaN
@@ -945,6 +1206,7 @@ def objective(trial: optuna.Trial, args) -> float:
         return eval_loss
 
     except torch.cuda.OutOfMemoryError:
+        _wandb_exit_code = 1
         logger.warning(f"트라이얼 {trial.number} OOM 발생")
         discord_trial_pruned(trial.number,
             f"GPU 메모리 부족 (batch={trial.params.get('batch_size','?')}, "
@@ -952,10 +1214,11 @@ def objective(trial: optuna.Trial, args) -> float:
         raise optuna.TrialPruned()
 
     except optuna.TrialPruned:
-        # Already notified by Optuna callback or OOM handler above
+        _wandb_exit_code = 1
         raise
 
     except Exception as e:
+        _wandb_exit_code = 1
         logger.error(f"트라이얼 {trial.number} 실패: {e}", exc_info=True)
         discord_trial_error(trial.number, str(e)[:500])
         raise optuna.TrialPruned()
@@ -977,9 +1240,12 @@ def objective(trial: optuna.Trial, args) -> float:
                 trainer.model = None
             trainer.callback_handler = None
         if model is not None:
-            model.cpu()  # Move off GPU before deleting
+            try:
+                model.cpu()  # Move off GPU before deleting
+            except Exception:
+                pass  # Model may be in broken state after CUDA error
         del trainer, model, tokenizer, train_dataset, val_dataset
-        wandb_finish(wandb_run, exit_code=0)
+        wandb_finish(wandb_run, exit_code=_wandb_exit_code)
         clear_gpu_memory()
         shutil.rmtree(trial_dir, ignore_errors=True)
 
@@ -1157,6 +1423,8 @@ def retrain_best(study: optuna.Study):
                 optim="adamw_8bit",
                 weight_decay=p["weight_decay"],
                 lr_scheduler_type=p["lr_scheduler"],
+                max_grad_norm=1.0,
+                dataloader_num_workers=0,
                 seed=RANDOM_SEED,
                 output_dir=BEST_MODEL_DIR,
                 report_to=report_to,
@@ -1226,9 +1494,22 @@ def retrain_best(study: optuna.Study):
     finally:
         if trainer is not None:
             trainer.data_collator = None
-        del trainer, model, tokenizer
+            if hasattr(trainer, "optimizer") and trainer.optimizer is not None:
+                trainer.optimizer.zero_grad(set_to_none=True)
+                for group in trainer.optimizer.param_groups:
+                    group["params"] = []
+                trainer.optimizer = None
+            if hasattr(trainer, "lr_scheduler"):
+                trainer.lr_scheduler = None
+            if hasattr(trainer, "model"):
+                trainer.model = None
+        if model is not None:
+            try:
+                model.cpu()
+            except Exception:
+                pass
+        del trainer, model, tokenizer, train_dataset, val_dataset
         wandb_finish(wandb_run)
-        gc.collect()
         clear_gpu_memory()
 
 
@@ -1343,6 +1624,12 @@ def main():
         best_params=study.best_trial.params,
         completed=len(completed), pruned=len(pruned),
         total_time_hr=search_hours,
+    )
+
+    # Upload DB after phase completes (final backup of all trial data)
+    github_upload_db(
+        f"{mode} 완료: {len(completed)} trials, "
+        f"best={study.best_trial.value:.6f}"
     )
 
     # ─── Retrain ──────────────────────────────────────────────────────
