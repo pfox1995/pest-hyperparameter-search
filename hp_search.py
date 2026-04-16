@@ -1164,6 +1164,8 @@ def objective(trial: optuna.Trial, args) -> float:
             eval_result = {
                 "accuracy": 0, "f1_macro": 0, "f1_weighted": 0,
                 "precision_macro": 0, "recall_macro": 0, "total": 0,
+                "per_class": {}, "confusion_matrix": [],
+                "confusion_matrix_path": None,
             }
             logger.info(
                 f"트라이얼 {trial.number} — eval_loss {eval_loss:.4f} > "
