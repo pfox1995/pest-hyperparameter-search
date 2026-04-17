@@ -85,7 +85,11 @@ QUICK_DATA_FRACTION = 0.2
 QUICK_EPOCHS        = 1
 PROXY_DATA_FRACTION = 0.05
 PROXY_EPOCHS        = 1
-PROXY_MAX_STEPS     = 300    # Fixed compute budget: normalizes trial duration across bs/ga
+# Sample-budget (not step-count): wall time is dominated by CPU image
+# preprocessing, which scales with eff_batch * max_steps. Targeting a
+# fixed SAMPLES count normalizes wall time regardless of bs/ga choice.
+PROXY_SAMPLE_BUDGET = 1600   # ~30 min/trial on A6000 with 9B VLM + LoRA
+PROXY_MIN_STEPS     = 50     # Floor so very-large-eff_batch trials still train
 PROXY_VAL_CAP       = 150    # Cap val set for trainer loss eval (full val was ~thousands)
 
 # RAM-aware data fraction cap
@@ -1054,9 +1058,15 @@ def objective(trial: optuna.Trial, args) -> float:
             val_dataset = val_dataset[:PROXY_VAL_CAP]
         logger.info(f"데이터 로딩 완료 — train: {len(train_dataset)}, val: {len(val_dataset)}")
 
+        # ─── Proxy compute budget (sample-normalized, not step-count) ─
+        proxy_max_steps = max(
+            PROXY_MIN_STEPS,
+            PROXY_SAMPLE_BUDGET // (batch_size * grad_accum),
+        )
+
         # ─── Clamp warmup to avoid exceeding total training steps ─────
         if args.proxy:
-            total_steps = PROXY_MAX_STEPS
+            total_steps = proxy_max_steps
         else:
             steps_per_epoch = math.ceil(len(train_dataset) / (batch_size * grad_accum))
             total_steps = steps_per_epoch * num_epochs
@@ -1146,7 +1156,7 @@ def objective(trial: optuna.Trial, args) -> float:
                 # Proxy: fixed compute budget; also skip epoch-end eval
                 # since NopPruner never consumes it (duplicate of the
                 # explicit trainer.evaluate() below).
-                max_steps=PROXY_MAX_STEPS if args.proxy else -1,
+                max_steps=proxy_max_steps if args.proxy else -1,
                 learning_rate=lr, bf16=True,
                 logging_steps=20,
                 save_strategy="no",
