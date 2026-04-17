@@ -135,6 +135,15 @@ SEARCH_SPACE = {
 
 _line_count_cache = {}
 
+# Cross-trial cache of decoded images. Keyed by (split, fraction).
+# Image decode + LANCZOS resize is ~7min/trial at 580 samples and was
+# previously repeated on every trial. Caching amortizes it to once per
+# (split, fraction) pair for the whole study.
+# Each entry: list of {"label": str, "full": PIL, "tight": PIL|None}
+# The "tight" crop is pre-computed from the bbox so per-trial assembly
+# can just coin-flip between full/tight without re-opening the file.
+_PRELOADED_SAMPLES: dict = {}
+
 
 def _get_line_count(path: str) -> int:
     """Count lines in a file, caching the result across trials."""
@@ -594,26 +603,30 @@ def make_conversation(image, label):
     }
 
 
-def load_dataset_from_jsonl(split, tight_prob=0.5, fraction=1.0):
-    """Load dataset with 2-way crop strategy for pest images.
+def _preload_samples(split: str, fraction: float) -> list:
+    """Decode and cache a fixed subset of samples for cross-trial reuse.
 
-    For pest images with bounding boxes:
-      - Tight crop (bbox only):    probability = tight_prob
-      - Original image (no crop):  probability = 1 - tight_prob
-
-    Normal ("정상") images always use the original.
+    Called once per unique (split, fraction). Subsequent calls return the
+    cached list instantly. Subset selection uses a FIXED seed (RANDOM_SEED)
+    regardless of trial number — all trials see the same images, which
+    makes trial ranking comparable. Per-trial variation comes from
+    crop/prompt/shuffle choices in the assembly step, not subset.
     """
-    jsonl_path = os.path.join(DATA_DIR, f"{split}.jsonl")
+    key = (split, round(fraction, 4))
+    if key in _PRELOADED_SAMPLES:
+        return _PRELOADED_SAMPLES[key]
 
+    jsonl_path = os.path.join(DATA_DIR, f"{split}.jsonl")
     total_lines = _get_line_count(jsonl_path)
 
+    # Fixed-seed RNG just for subset selection — doesn't touch global random
+    _rng = random.Random(RANDOM_SEED)
     if fraction < 1.0:
-        keep = set(random.sample(range(total_lines), int(total_lines * fraction)))
+        keep = set(_rng.sample(range(total_lines), int(total_lines * fraction)))
     else:
         keep = None
 
-    dataset = []
-
+    samples = []
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             if keep is not None and i not in keep:
@@ -645,26 +658,55 @@ def load_dataset_from_jsonl(split, tight_prob=0.5, fraction=1.0):
 
             class_name, img_filename = parts[1], parts[2]
 
-            if label == "정상":
-                img = cap_image_size(Image.open(img_path).convert("RGB"))
-                dataset.append(make_conversation(img, label))
-            else:
+            # Full-frame image (decoded and capped once)
+            full_img = cap_image_size(Image.open(img_path).convert("RGB"))
+
+            # Pre-compute tight bbox crop from the uncapped original so the
+            # crop is pixel-accurate (bbox coords are in original space).
+            tight_img = None
+            if label != "정상":
                 bbox = find_label_json(split, class_name, img_filename)
                 if bbox:
-                    img = Image.open(img_path).convert("RGB")
-                    if random.random() < tight_prob:
-                        # Tight crop — pest morphology
-                        cropped = cap_image_size(
-                            crop_to_bbox(img, bbox, padding_ratio=0.0))
-                        img.close()
-                        dataset.append(make_conversation(cropped, label))
-                    else:
-                        # Original image — learn to locate pest in full frame
-                        img = cap_image_size(img)
-                        dataset.append(make_conversation(img, label))
-                else:
-                    img = cap_image_size(Image.open(img_path).convert("RGB"))
-                    dataset.append(make_conversation(img, label))
+                    orig = Image.open(img_path).convert("RGB")
+                    tight_img = cap_image_size(
+                        crop_to_bbox(orig, bbox, padding_ratio=0.0))
+                    orig.close()
+
+            samples.append({
+                "label": label,
+                "full": full_img,
+                "tight": tight_img,
+            })
+
+    _PRELOADED_SAMPLES[key] = samples
+    logger.info(
+        f"이미지 캐시 적재 완료 — split={split}, fraction={fraction}, "
+        f"{len(samples)}개 샘플 (이후 트라이얼에서 재사용)"
+    )
+    return samples
+
+
+def load_dataset_from_jsonl(split, tight_prob=0.5, fraction=1.0):
+    """Build a per-trial dataset list from the cached preloaded samples.
+
+    For pest images with bounding boxes:
+      - Tight crop (bbox only):    probability = tight_prob
+      - Original image (no crop):  probability = 1 - tight_prob
+
+    Normal ("정상") images and images without bboxes always use the original.
+    Caller controls per-trial variation via global random.seed() before call.
+    """
+    samples = _preload_samples(split, fraction)
+
+    dataset = []
+    for s in samples:
+        if s["tight"] is None:
+            img = s["full"]
+        elif random.random() < tight_prob:
+            img = s["tight"]
+        else:
+            img = s["full"]
+        dataset.append(make_conversation(img, s["label"]))
 
     random.shuffle(dataset)
     return dataset
