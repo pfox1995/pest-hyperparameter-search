@@ -54,7 +54,7 @@ torch.set_float32_matmul_precision("high")
 # Suppress DecompressionBombWarning for large pest images
 # and prevent OOM by capping max image size
 Image.MAX_IMAGE_PIXELS = None
-MAX_IMAGE_DIM = 1024  # Resize images larger than this (model uses 512px anyway)
+MAX_IMAGE_DIM = 768  # Resize images larger than this (model processes at 512px)
 
 # ═══════════════════════════════════════════════════════════════════════
 # 1. CONFIGURATION
@@ -83,8 +83,10 @@ GITHUB_REPO  = os.environ.get("GITHUB_REPO", "pfox1995/pest-hyperparameter-searc
 
 QUICK_DATA_FRACTION = 0.2
 QUICK_EPOCHS        = 1
-PROXY_DATA_FRACTION = 0.1
+PROXY_DATA_FRACTION = 0.05
 PROXY_EPOCHS        = 1
+PROXY_MAX_STEPS     = 300    # Fixed compute budget: normalizes trial duration across bs/ga
+PROXY_VAL_CAP       = 150    # Cap val set for trainer loss eval (full val was ~thousands)
 
 # RAM-aware data fraction cap
 # Each 1024x1024 RGB image ≈ 3MB in memory.  Reserve ~15GB for
@@ -1045,11 +1047,19 @@ def objective(trial: optuna.Trial, args) -> float:
         val_dataset = load_dataset_from_jsonl(
             "val", tight_prob=0.5, fraction=1.0,
         )
+        # In proxy mode, cap val set — trainer loss on ~150 samples is
+        # enough to rank trials; eval over the full val was burning
+        # ~10-15 min per trial.
+        if args.proxy and len(val_dataset) > PROXY_VAL_CAP:
+            val_dataset = val_dataset[:PROXY_VAL_CAP]
         logger.info(f"데이터 로딩 완료 — train: {len(train_dataset)}, val: {len(val_dataset)}")
 
         # ─── Clamp warmup to avoid exceeding total training steps ─────
-        steps_per_epoch = math.ceil(len(train_dataset) / (batch_size * grad_accum))
-        total_steps = steps_per_epoch * num_epochs
+        if args.proxy:
+            total_steps = PROXY_MAX_STEPS
+        else:
+            steps_per_epoch = math.ceil(len(train_dataset) / (batch_size * grad_accum))
+            total_steps = steps_per_epoch * num_epochs
         if warmup > total_steps // 2:
             old_warmup = warmup
             warmup = max(0, total_steps // 4)
@@ -1133,10 +1143,14 @@ def objective(trial: optuna.Trial, args) -> float:
                 gradient_accumulation_steps=grad_accum,
                 warmup_steps=warmup,
                 num_train_epochs=num_epochs,
+                # Proxy: fixed compute budget; also skip epoch-end eval
+                # since NopPruner never consumes it (duplicate of the
+                # explicit trainer.evaluate() below).
+                max_steps=PROXY_MAX_STEPS if args.proxy else -1,
                 learning_rate=lr, bf16=True,
                 logging_steps=20,
                 save_strategy="no",
-                eval_strategy="epoch",
+                eval_strategy="no" if args.proxy else "epoch",
                 optim="adamw_8bit",
                 weight_decay=wd,
                 lr_scheduler_type=scheduler,
