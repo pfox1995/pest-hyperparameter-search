@@ -29,6 +29,7 @@ import gc
 import json
 import logging
 import os
+import pickle
 import random
 import math
 import shutil
@@ -67,6 +68,7 @@ BEST_MODEL_DIR = os.environ.get("HP_BEST_MODEL_DIR", f"{VOLUME_DIR}/best-pest-de
 DB_PATH        = os.environ.get("HP_DB_PATH", f"{VOLUME_DIR}/hp_search_results.db")
 STORAGE_DB     = f"sqlite:///{DB_PATH}"
 LOG_FILE       = os.environ.get("HP_LOG_FILE", f"{VOLUME_DIR}/hp_search.log")
+PRELOAD_CACHE_DIR = os.environ.get("HP_PRELOAD_CACHE_DIR", f"{VOLUME_DIR}/preload_cache")
 
 STUDY_NAME       = "pest-detection-hpsearch"
 BASE_MODEL       = "unsloth/Qwen3.5-9B"
@@ -616,6 +618,28 @@ def _preload_samples(split: str, fraction: float) -> list:
     if key in _PRELOADED_SAMPLES:
         return _PRELOADED_SAMPLES[key]
 
+    # Disk cache — survives process restarts. Keyed on (split, fraction,
+    # MAX_IMAGE_DIM) so a resize-cap change produces a fresh cache file.
+    os.makedirs(PRELOAD_CACHE_DIR, exist_ok=True)
+    cache_file = os.path.join(
+        PRELOAD_CACHE_DIR,
+        f"{split}_f{round(fraction, 4)}_d{MAX_IMAGE_DIM}.pkl",
+    )
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "rb") as f:
+                samples = pickle.load(f)
+            _PRELOADED_SAMPLES[key] = samples
+            logger.info(
+                f"이미지 캐시 디스크에서 로드 — {cache_file}, "
+                f"{len(samples)}개 샘플"
+            )
+            return samples
+        except Exception as e:
+            logger.warning(
+                f"디스크 캐시 로드 실패 ({cache_file}): {e} — 재생성"
+            )
+
     jsonl_path = os.path.join(DATA_DIR, f"{split}.jsonl")
     total_lines = _get_line_count(jsonl_path)
 
@@ -679,6 +703,12 @@ def _preload_samples(split: str, fraction: float) -> list:
             })
 
     _PRELOADED_SAMPLES[key] = samples
+    try:
+        with open(cache_file, "wb") as f:
+            pickle.dump(samples, f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info(f"이미지 캐시 디스크 저장 — {cache_file}")
+    except Exception as e:
+        logger.warning(f"디스크 캐시 저장 실패 ({cache_file}): {e}")
     logger.info(
         f"이미지 캐시 적재 완료 — split={split}, fraction={fraction}, "
         f"{len(samples)}개 샘플 (이후 트라이얼에서 재사용)"
