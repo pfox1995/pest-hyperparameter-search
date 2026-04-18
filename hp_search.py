@@ -88,15 +88,20 @@ QUICK_EPOCHS        = 1
 PROXY_DATA_FRACTION = 0.05
 PROXY_EPOCHS        = 1
 # Wall-clock-aware step estimation: targets 30-40 min per trial regardless
-# of sampled batch_size/grad_accum/finetune_vision. Per-step time is
-# dominated by CPU image preprocessing, which scales with effective batch;
-# finetune_vision adds ~30% because vision-tower grads flow through larger
-# activations. Calibrated from measured 19s/step at eff=16, vision=False.
-PROXY_TARGET_MIN    = 35     # target wall-clock per trial (minutes)
-PROXY_STEP_K        = 1.2    # sec per sample (CPU-bound decode+collate cost)
-PROXY_VISION_MULT   = 1.3    # step-time multiplier when finetune_vision=True
-PROXY_STEPS_FLOOR   = 50     # never go below — need training signal
-PROXY_STEPS_CEILING = 200    # never exceed — keeps wall time bounded
+# of sampled batch_size/grad_accum/finetune_vision.
+# Model (two components, NOT proportional to eff_batch alone):
+#   step_sec = (OVERHEAD × grad_accum) + (PER_SAMPLE × eff_batch) × vision_mult
+# - OVERHEAD: per-micro-batch kernel launch + collator setup (fires ga times/step)
+# - PER_SAMPLE: per-sample forward-backward compute (scales with eff_batch)
+# This separation matters because bs=1,ga=8 and bs=4,ga=2 both give eff=8
+# but the former runs the forward loop 4× more times per step.
+# Calibrated from measured 19s/step at bs=4, ga=4, vision=False.
+PROXY_TARGET_MIN       = 35     # target wall-clock per trial (minutes)
+PROXY_STEP_OVERHEAD    = 1.5    # sec per micro-batch (ga × this per step)
+PROXY_STEP_PER_SAMPLE  = 1.0    # sec per sample (eff_batch × this per step)
+PROXY_VISION_MULT      = 1.3    # step-time multiplier when finetune_vision=True
+PROXY_STEPS_FLOOR      = 50     # never go below — need training signal
+PROXY_STEPS_CEILING    = 200    # never exceed — keeps wall time bounded
 PROXY_VAL_CAP       = 150    # Cap val set for trainer loss eval (full val was ~thousands)
 
 # RAM-aware data fraction cap
@@ -755,19 +760,23 @@ def estimate_proxy_max_steps(
 ) -> int:
     """Pick max_steps so proxy trial wall time lands near target_min.
 
-    Model: step_sec ≈ PROXY_STEP_K × eff_batch × (vision_mult if vision)
-    Clamped to [PROXY_STEPS_FLOOR, PROXY_STEPS_CEILING].
+    Two-component model (separates per-micro-batch overhead from per-sample
+    compute) — critical because bs=1,ga=8 runs 8 micro-batches per step
+    while bs=4,ga=2 runs only 2 even though both have eff_batch=8.
 
-    Calibrated from 19 s/step observed at eff_batch=16, vision=False:
-      PROXY_STEP_K = 19 / 16 = 1.19 s/sample → rounded to 1.2.
+        step_sec = (OVERHEAD × grad_accum
+                    + PER_SAMPLE × eff_batch) × vision_mult
 
-    Rationale: per-step cost is dominated by CPU image decode+collate
-    (GPU utilization was 28% at eff=16). Scales linearly with samples
-    per step. finetune_vision multiplies step cost ~1.3× from extra
-    backward pass through the vision tower.
+    Calibrated from 19 s/step observed at bs=4, ga=4, vision=False:
+        predicted: 1.5×4 + 1.0×16 = 22s (15% overestimate — conservative
+        direction; wall time undershoots target rather than overshoots).
     """
     eff_batch = batch_size * grad_accum
-    step_sec = PROXY_STEP_K * eff_batch * (PROXY_VISION_MULT if finetune_vision else 1.0)
+    base_step_sec = (
+        PROXY_STEP_OVERHEAD * grad_accum
+        + PROXY_STEP_PER_SAMPLE * eff_batch
+    )
+    step_sec = base_step_sec * (PROXY_VISION_MULT if finetune_vision else 1.0)
     target_sec = target_min * 60
     raw_steps = int(target_sec / step_sec)
     return max(PROXY_STEPS_FLOOR, min(PROXY_STEPS_CEILING, raw_steps))
