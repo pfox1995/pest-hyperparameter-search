@@ -87,11 +87,16 @@ QUICK_DATA_FRACTION = 0.2
 QUICK_EPOCHS        = 1
 PROXY_DATA_FRACTION = 0.05
 PROXY_EPOCHS        = 1
-# Fixed step count (not sample-budget): empirically, trials with small
-# effective batch are duds regardless of how long they train, so there's
-# no point giving them proportionally more steps. TPE learns to avoid
-# small-eff_batch configs within a few trials. Fail fast on duds.
-PROXY_MAX_STEPS     = 100
+# Wall-clock-aware step estimation: targets 30-40 min per trial regardless
+# of sampled batch_size/grad_accum/finetune_vision. Per-step time is
+# dominated by CPU image preprocessing, which scales with effective batch;
+# finetune_vision adds ~30% because vision-tower grads flow through larger
+# activations. Calibrated from measured 19s/step at eff=16, vision=False.
+PROXY_TARGET_MIN    = 35     # target wall-clock per trial (minutes)
+PROXY_STEP_K        = 1.2    # sec per sample (CPU-bound decode+collate cost)
+PROXY_VISION_MULT   = 1.3    # step-time multiplier when finetune_vision=True
+PROXY_STEPS_FLOOR   = 50     # never go below — need training signal
+PROXY_STEPS_CEILING = 200    # never exceed — keeps wall time bounded
 PROXY_VAL_CAP       = 150    # Cap val set for trainer loss eval (full val was ~thousands)
 
 # RAM-aware data fraction cap
@@ -742,6 +747,32 @@ def load_dataset_from_jsonl(split, tight_prob=0.5, fraction=1.0):
     return dataset
 
 
+def estimate_proxy_max_steps(
+    batch_size: int,
+    grad_accum: int,
+    finetune_vision: bool,
+    target_min: float = PROXY_TARGET_MIN,
+) -> int:
+    """Pick max_steps so proxy trial wall time lands near target_min.
+
+    Model: step_sec ≈ PROXY_STEP_K × eff_batch × (vision_mult if vision)
+    Clamped to [PROXY_STEPS_FLOOR, PROXY_STEPS_CEILING].
+
+    Calibrated from 19 s/step observed at eff_batch=16, vision=False:
+      PROXY_STEP_K = 19 / 16 = 1.19 s/sample → rounded to 1.2.
+
+    Rationale: per-step cost is dominated by CPU image decode+collate
+    (GPU utilization was 28% at eff=16). Scales linearly with samples
+    per step. finetune_vision multiplies step cost ~1.3× from extra
+    backward pass through the vision tower.
+    """
+    eff_batch = batch_size * grad_accum
+    step_sec = PROXY_STEP_K * eff_batch * (PROXY_VISION_MULT if finetune_vision else 1.0)
+    target_sec = target_min * 60
+    raw_steps = int(target_sec / step_sec)
+    return max(PROXY_STEPS_FLOOR, min(PROXY_STEPS_CEILING, raw_steps))
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 5. GPU MEMORY MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════════
@@ -1130,9 +1161,22 @@ def objective(trial: optuna.Trial, args) -> float:
             val_dataset = val_dataset[:PROXY_VAL_CAP]
         logger.info(f"데이터 로딩 완료 — train: {len(train_dataset)}, val: {len(val_dataset)}")
 
+        # ─── Compute proxy max_steps from wall-clock target ───────────
+        proxy_max_steps = estimate_proxy_max_steps(
+            batch_size=batch_size,
+            grad_accum=grad_accum,
+            finetune_vision=ft_vision,
+        )
+        if args.proxy:
+            logger.info(
+                f"프록시 스텝 예측: eff_batch={batch_size*grad_accum}, "
+                f"vision={ft_vision} -> max_steps={proxy_max_steps} "
+                f"(목표 {PROXY_TARGET_MIN}분)"
+            )
+
         # ─── Clamp warmup to avoid exceeding total training steps ─────
         if args.proxy:
-            total_steps = PROXY_MAX_STEPS
+            total_steps = proxy_max_steps
         else:
             steps_per_epoch = math.ceil(len(train_dataset) / (batch_size * grad_accum))
             total_steps = steps_per_epoch * num_epochs
@@ -1222,7 +1266,7 @@ def objective(trial: optuna.Trial, args) -> float:
                 # Proxy: fixed compute budget; also skip epoch-end eval
                 # since NopPruner never consumes it (duplicate of the
                 # explicit trainer.evaluate() below).
-                max_steps=PROXY_MAX_STEPS if args.proxy else -1,
+                max_steps=proxy_max_steps if args.proxy else -1,
                 learning_rate=lr, bf16=True,
                 logging_steps=20,
                 save_strategy="no",
