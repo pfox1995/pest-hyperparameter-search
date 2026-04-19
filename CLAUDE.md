@@ -36,11 +36,22 @@ Without this copy, the training will keep running the old version.
 ### Restarting training
 ```bash
 tmux kill-session -t hp_search 2>/dev/null
-tmux new-session -d -s hp_search bash -c "cd /workspace && \
-  python3 hp_search.py --proxy --n-trials 50 2>&1 | tee -a /workspace/hp_search.log && \
-  python3 hp_search.py --n-trials 10 --retrain 2>&1 | tee -a /workspace/hp_search.log && \
+tmux new-session -d -s hp_search bash -c "set -o pipefail; cd /workspace; \
+  python3 hp_search.py --proxy --n-trials 50 2>&1 | tee -a /workspace/hp_search.log; P1=\${PIPESTATUS[0]}; \
+  [ \$P1 -ne 0 ] && { echo \"Phase 1 failed: \$P1\"; exec bash; }; \
+  python3 hp_search.py --n-trials 10 --retrain 2>&1 | tee -a /workspace/hp_search.log; P2=\${PIPESTATUS[0]}; \
+  [ \$P2 -ne 0 ] && { echo \"Phase 2 failed: \$P2\"; exec bash; }; \
   exec bash"
 ```
+
+**CRITICAL: `set -o pipefail` + `\${PIPESTATUS[0]}` are mandatory.** Without
+them, `python | tee` returns tee's exit code (always 0 if the log is
+writable), so a python crash — including SIGKILL from the OOM killer —
+silently falls through to the next phase / `exec bash` with no Discord
+alert. The python `discord_error()` path can't catch SIGKILL either (it's
+uncatchable by definition), so the shell wrapper is the only safety net.
+`setup_runpod.sh` already does this correctly and posts to Discord on
+non-zero exit; mirror its pattern for any manual restart.
 
 ### Monitoring
 - `tmux attach -t hp_search` — live view
