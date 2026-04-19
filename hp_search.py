@@ -33,6 +33,7 @@ import pickle
 import random
 import math
 import shutil
+import signal
 import sys
 import threading
 import time
@@ -302,6 +303,24 @@ def discord_error(error):
         "description": f"```{str(error)[:800]}```", "color": 0xe74c3c,
         "footer": {"text": f"{_kst_now()} KST"},
     })
+
+
+# Catchable signals → Discord alert before exit. SIGKILL/OOM-kill cannot be
+# trapped here — the bash wrapper in setup_runpod.sh detects those via
+# ${PIPESTATUS[0]} and posts its own webhook.
+def _install_fatal_signal_handlers():
+    def _handler(signum, _frame):
+        name = signal.Signals(signum).name
+        try:
+            discord_error(f"프로세스가 시그널 {name}({signum})로 종료됨")
+            time.sleep(1.5)  # let the fire-and-forget Discord thread flush
+        finally:
+            os._exit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -660,7 +679,14 @@ def _preload_samples(split: str, fraction: float) -> list:
     else:
         keep = None
 
+    expected = len(keep) if keep is not None else total_lines
+    logger.info(
+        f"이미지 캐시 적재 시작 — split={split}, fraction={fraction}, "
+        f"~{expected}개 디코딩 예정 (RAM 사용량 주의)"
+    )
+
     samples = []
+    _preload_t0 = time.time()
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             if keep is not None and i not in keep:
@@ -711,6 +737,14 @@ def _preload_samples(split: str, fraction: float) -> list:
                 "full": full_img,
                 "tight": tight_img,
             })
+
+            if len(samples) % 1000 == 0:
+                elapsed = time.time() - _preload_t0
+                rate = len(samples) / max(elapsed, 1e-3)
+                logger.info(
+                    f"  preload 진행: {len(samples)}/{expected} "
+                    f"({elapsed:.0f}s, {rate:.1f} img/s)"
+                )
 
     _PRELOADED_SAMPLES[key] = samples
     try:
@@ -1796,6 +1830,8 @@ def main():
             logging.FileHandler(LOG_FILE, encoding="utf-8"),
         ],
     )
+
+    _install_fatal_signal_handlers()
 
     # ─── Analyze only ─────────────────────────────────────────────────
 

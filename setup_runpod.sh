@@ -234,20 +234,48 @@ echo "  Optuna DB가 GitHub에 자동 백업됩니다."
 echo ""
 
 # Start training in tmux session
+#
+# CRITICAL: 'set -o pipefail' + ${PIPESTATUS[0]} are required so that a
+# python crash (incl. SIGKILL from OOM killer) is detected. Without these,
+# 'python | tee' returns tee's exit code (always 0 if log is writable) and
+# the silent failure falls through to the next phase / exec bash with no
+# alert. This bit us in Phase 2 once already.
 tmux new-session -d -s "$SESSION_NAME" bash -c "
+    set -o pipefail
     cd /workspace
+
+    notify_failure() {
+        local phase=\"\$1\"
+        local exit_code=\"\$2\"
+        local tail_lines
+        tail_lines=\$(tail -n 30 '${HP_LOG_FILE}' 2>/dev/null | sed 's/\"/\\\\\"/g' | tr '\n' '\\\\n' | head -c 1500)
+        if [ -n \"\${DISCORD_WEBHOOK_URL:-}\" ]; then
+            curl -sS -H 'Content-Type: application/json' -X POST \\
+                -d '{\"content\":\"💥 **'\"\$phase\"' 비정상 종료** (exit='\"\$exit_code\"', SIGKILL/OOM 가능성)\\n\`\`\`'\"\$tail_lines\"'\`\`\`\"}' \\
+                \"\$DISCORD_WEBHOOK_URL\" >/dev/null 2>&1 || true
+        fi
+        echo \"\$phase 실패 (exit code: \$exit_code)\"
+    }
 
     echo '=== Phase 1: Proxy 검색 시작 (seeded trials run first) ==='
     python3 hp_search.py --proxy --n-trials 50 2>&1 | tee -a '${HP_LOG_FILE}'
-    PHASE1_EXIT=\$?
+    PHASE1_EXIT=\${PIPESTATUS[0]}
 
     if [ \$PHASE1_EXIT -ne 0 ]; then
-        echo 'Phase 1 실패 (exit code: '\$PHASE1_EXIT'). Phase 2를 건너뜁니다.'
-        exit \$PHASE1_EXIT
+        notify_failure 'Phase 1' \$PHASE1_EXIT
+        echo 'Phase 2를 건너뜁니다.'
+        exec bash
     fi
 
     echo '=== Phase 2: Full 검색 + 재학습 시작 ==='
     python3 hp_search.py --n-trials 10 --retrain 2>&1 | tee -a '${HP_LOG_FILE}'
+    PHASE2_EXIT=\${PIPESTATUS[0]}
+
+    if [ \$PHASE2_EXIT -ne 0 ]; then
+        notify_failure 'Phase 2' \$PHASE2_EXIT
+        echo 'Phase 3를 건너뜁니다.'
+        exec bash
+    fi
 
     echo '=== Phase 3: GitHub 릴리스 업로드 ==='
     python3 -c \"
