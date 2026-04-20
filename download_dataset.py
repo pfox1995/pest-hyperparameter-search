@@ -170,7 +170,7 @@ def verify_download():
     # Count samples in JSONL files
     for fname in REQUIRED_FILES:
         fpath = os.path.join(DATA_DIR, fname)
-        with open(fpath, "r") as f:
+        with open(fpath, "r", encoding="utf-8") as f:
             n_lines = sum(1 for _ in f)
         logger.info(f"  {fname}: {n_lines:,}개 샘플")
 
