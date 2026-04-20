@@ -760,6 +760,88 @@ def _preload_samples(split: str, fraction: float) -> list:
     return samples
 
 
+class LazyImageDataset:
+    """Lazy-decode per-__getitem__ — avoids ~20 GB preload cost for one-shot runs.
+
+    Enable via HP_LAZY_DATASET=1. Preserves identical sampling semantics to the
+    eager path (same fraction subset, same tight/full probability, same labels);
+    only difference is images are decoded when accessed, not upfront. Memory
+    footprint drops from O(all_images_decoded) to O(worker_pool × batch).
+    """
+
+    def __init__(self, split, tight_prob, fraction):
+        self.tight_prob = tight_prob
+        self.samples = self._collect_metadata(split, fraction)
+        logger.info(
+            f"LazyImageDataset 생성 — split={split}, "
+            f"{len(self.samples)}개 샘플 (지연 디코딩, 프리로드 생략)"
+        )
+
+    @staticmethod
+    def _collect_metadata(split, fraction):
+        jsonl_path = os.path.join(DATA_DIR, f"{split}.jsonl")
+        total_lines = _get_line_count(jsonl_path)
+        _rng = random.Random(RANDOM_SEED)
+        if fraction < 1.0:
+            keep = set(_rng.sample(range(total_lines), int(total_lines * fraction)))
+        else:
+            keep = None
+
+        out = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if keep is not None and i not in keep:
+                    continue
+                record = json.loads(line)
+                messages = record["messages"]
+                label = messages[-1]["content"][0]["text"]
+
+                img_rel = None
+                for msg in messages:
+                    for content in msg["content"]:
+                        if content["type"] == "image" and "image" in content:
+                            img_rel = content["image"]
+                            break
+                if img_rel is None:
+                    continue
+
+                img_rel = img_rel.replace("\\", "/")
+                parts = img_rel.split("/")
+                if len(parts) < 3:
+                    continue
+
+                img_path = os.path.join(DATA_DIR, img_rel)
+                if not os.path.exists(img_path):
+                    continue
+
+                class_name, img_filename = parts[1], parts[2]
+                bbox = None
+                if label != "정상":
+                    bbox = find_label_json(split, class_name, img_filename)
+
+                out.append({
+                    "label": label,
+                    "img_path": img_path,
+                    "bbox": bbox,
+                })
+        return out
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        meta = self.samples[idx]
+        if meta["bbox"] is not None and random.random() < self.tight_prob:
+            orig = Image.open(meta["img_path"]).convert("RGB")
+            img = cap_image_size(
+                crop_to_bbox(orig, meta["bbox"], padding_ratio=0.0))
+            orig.close()
+        else:
+            img = cap_image_size(
+                Image.open(meta["img_path"]).convert("RGB"))
+        return make_conversation(img, meta["label"])
+
+
 def load_dataset_from_jsonl(split, tight_prob=0.5, fraction=1.0):
     """Build a per-trial dataset list from the cached preloaded samples.
 
@@ -769,7 +851,14 @@ def load_dataset_from_jsonl(split, tight_prob=0.5, fraction=1.0):
 
     Normal ("정상") images and images without bboxes always use the original.
     Caller controls per-trial variation via global random.seed() before call.
+
+    Set HP_LAZY_DATASET=1 to return a LazyImageDataset (decodes per-__getitem__)
+    instead of an eagerly-preloaded list. Recommended for one-shot retrains;
+    the eager path is better for HP search (many trials reuse decoded images).
     """
+    if os.environ.get("HP_LAZY_DATASET") == "1":
+        return LazyImageDataset(split, tight_prob, fraction)
+
     samples = _preload_samples(split, fraction)
 
     dataset = []
