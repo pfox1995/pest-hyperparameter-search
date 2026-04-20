@@ -1,12 +1,15 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════
-# RunPod Setup — Phase 2 RESUME (skip Phase 1, fetch DB, upload to HF)
+# RunPod Setup — Phase 2 RESUME (fetch DB, retrain best trial, upload to HF)
 # ═══════════════════════════════════════════════════════════════════════
 # Use when:
 #   - You already have a completed (or partial) Phase 1 SQLite DB backed up
 #     at https://raw.githubusercontent.com/<GITHUB_REPO>/main/hp_search_results.db
-#   - You're spinning up a fresh-volume pod and want to jump straight to
-#     Phase 2 (10 full-data trials + retrain best) and publish to HuggingFace.
+#   - You want to skip Phase 1 AND the Phase 2 trial loop entirely, and just
+#     retrain the current best trial (study.best_trial) on 100% data, then
+#     publish the adapter to HuggingFace.
+#   - If you want to run N additional full-fidelity trials first (to confirm
+#     the proxy winner), change `--n-trials 0` to `--n-trials N` in step [8/8].
 #
 # Required RunPod env vars / secrets:
 #   WANDB_API_KEY          — W&B API key
@@ -235,7 +238,8 @@ echo "  HF_REPO_ID=$HF_REPO_ID  (private=$HF_PRIVATE)"
 echo ""
 echo "=== [7/8] Phase 2 시작! ==="
 echo ""
-echo "  Phase 2: Full 검색 (10 trials, 전체 데이터) + 최적 모델 재학습"
+echo "  Phase 2: 최적 트라이얼 재학습 (전체 데이터, 1회)"
+echo "           - Proxy top-3 트라이얼이 동일한 아키텍처로 수렴 → 단일 재학습으로 단축"
 echo "  Phase 3: GitHub Release + HuggingFace 어댑터 업로드"
 echo ""
 echo "  tmux 세션에서 실행됩니다. SSH 연결이 끊어져도 계속됩니다."
@@ -253,8 +257,11 @@ echo ""
 tmux new-session -d -s "$SESSION_NAME" bash -c "
     cd /workspace
 
-    echo '=== Phase 2: Full 검색 + 재학습 시작 ==='
-    python3 hp_search.py --n-trials 10 --retrain 2>&1 | tee -a '${HP_LOG_FILE}'
+    echo '=== Phase 2: 최적 트라이얼 (#6) 재학습 시작 ==='
+    # --n-trials 0 = skip optimization loop, go straight to retrain_best(study)
+    # Proxy top-3 shared same architecture; trial #6 had lowest eval_loss. Skipping
+    # 10 extra full-fidelity trials saves ~40 GPU-hours with negligible accuracy risk.
+    python3 hp_search.py --n-trials 0 --retrain 2>&1 | tee -a '${HP_LOG_FILE}'
     PHASE2_EXIT=\$?
 
     if [ \$PHASE2_EXIT -ne 0 ]; then
