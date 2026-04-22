@@ -71,12 +71,12 @@ HP = {
     "learning_rate":      0.00011645105452323228,
     "weight_decay":       0.013802470048539942,
     "lr_scheduler_type":  "linear",
-    "warmup_steps":       0,
+    "warmup_ratio":       0.03,
     "max_grad_norm":      1.0,
     "adam_beta1":         0.9,
     "adam_beta2":         0.999,
     "adam_epsilon":       1e-8,
-    "optim":              "adamw_8bit",
+    "optim":              "adamw_torch",
 
     # Batch / sequence
     "per_device_train_batch_size": 1,
@@ -180,24 +180,32 @@ def main():
         description="Final retrain with frozen trial_015 HPs on PRO 6000",
     )
     parser.add_argument(
-        "--epochs", type=int, default=2,
-        help="Training epochs. Default 2 matches trial 015's sampled "
-             "value and the VLM-classification literature sweet spot "
-             "(Unsloth: 1-3 epochs; Qwen2.5-VL community: 3 common but "
-             "epoch-2 often peaks). Override to 3 if you have budget.",
+        "--epochs", type=int, default=1,
+        help="Training epochs. Default 1: the 2026-04-21 retrain showed the "
+             "model reaches trial-015-equivalent loss (~0.025) by step ~21 "
+             "(~1.5%% of epoch 1), then diverged catastrophically at step "
+             "~29 with adamw_8bit + no warmup. 1 epoch + frequent "
+             "checkpointing + load_best_model_at_end recovers the good region.",
     )
     parser.add_argument(
         "--output-dir", default=FINAL_OUTPUT_DIR,
         help="Where to save the final LoRA adapter + eval results.",
     )
     parser.add_argument(
-        "--save-strategy", default="epoch", choices=["no", "epoch", "steps"],
-        help="Checkpoint strategy. 'epoch' saves after each epoch (safer "
-             "for long runs; you can resume if pod dies).",
+        "--save-strategy", default="steps", choices=["no", "epoch", "steps"],
+        help="Checkpoint strategy. 'steps' (default) saves every --save-steps "
+             "so load_best_model_at_end can recover the pre-divergence checkpoint.",
     )
     parser.add_argument(
-        "--save-steps", type=int, default=500,
-        help="Save every N steps (only if --save-strategy=steps).",
+        "--save-steps", type=int, default=25,
+        help="Save every N steps (only if --save-strategy=steps). Default 25 "
+             "= ~3 min at ~8 s/step, small enough to catch the pre-divergence "
+             "window seen in run zhgoxqpx.",
+    )
+    parser.add_argument(
+        "--eval-steps", type=int, default=25,
+        help="Eval every N steps. Should match --save-steps so "
+             "load_best_model_at_end sees eval_loss for every saved checkpoint.",
     )
     parser.add_argument(
         "--no-eval", action="store_true",
@@ -317,7 +325,7 @@ def main():
         learning_rate=HP["learning_rate"],
         weight_decay=HP["weight_decay"],
         lr_scheduler_type=HP["lr_scheduler_type"],
-        warmup_steps=HP["warmup_steps"],
+        warmup_ratio=HP["warmup_ratio"],
         max_grad_norm=HP["max_grad_norm"],
         adam_beta1=HP["adam_beta1"],
         adam_beta2=HP["adam_beta2"],
@@ -339,11 +347,13 @@ def main():
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
         save_total_limit=3,
-        eval_strategy="epoch" if not args.no_eval else "no",
+        eval_strategy=(args.save_strategy if not args.no_eval else "no"),
+        eval_steps=args.eval_steps,
         eval_accumulation_steps=2,
 
-        # Load best at end only if we're saving epoch checkpoints
-        load_best_model_at_end=(args.save_strategy == "epoch" and not args.no_eval),
+        # load_best_model_at_end requires save_strategy == eval_strategy
+        # (HF Trainer enforces this). Also requires a metric.
+        load_best_model_at_end=(args.save_strategy != "no" and not args.no_eval),
         metric_for_best_model="eval_loss" if not args.no_eval else None,
         greater_is_better=False,
 

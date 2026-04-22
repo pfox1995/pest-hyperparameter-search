@@ -830,6 +830,8 @@ class LazyImageDataset:
         return len(self.samples)
 
     def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(len(self.samples)))]
         meta = self.samples[idx]
         if meta["bbox"] is not None and random.random() < self.tight_prob:
             orig = Image.open(meta["img_path"]).convert("RGB")
