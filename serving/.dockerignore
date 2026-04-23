@@ -1,0 +1,10 @@
+# Keep Docker build context small.
+__pycache__
+*.pyc
+*.pyo
+*.log
+.git
+.gitignore
+README.md
+client_example.py
+# Do NOT exclude pest-detector-merged/ — we COPY it into the image.
