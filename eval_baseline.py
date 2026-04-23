@@ -39,7 +39,7 @@ from hp_search import BASE_MODEL, SYSTEM_MSG  # noqa: E402
 FIXED_PROMPT = "이 사진에 있는 해충의 이름을 알려주세요."
 FIXED_SIZE = 512
 FILL_COLOR = (128, 128, 128)
-FIXED_OUTPUT_TOKENS = 16
+MAX_NEW_TOKENS = 12  # pest names are 2-9 tokens; 12 is plenty
 
 
 def letterbox(img: Image.Image, size: int = FIXED_SIZE) -> Image.Image:
@@ -142,8 +142,7 @@ def main():
                 ).to("cuda")
                 with torch.inference_mode():
                     kwargs = dict(
-                        max_new_tokens=FIXED_OUTPUT_TOKENS,
-                        min_new_tokens=FIXED_OUTPUT_TOKENS,
+                        max_new_tokens=MAX_NEW_TOKENS,
                         use_cache=True,
                         do_sample=False,
                     )
