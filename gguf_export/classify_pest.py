@@ -90,8 +90,16 @@ def classify(image_path: str, server_url: str, max_tokens: int = 30) -> dict:
         body = json.loads(r.read())
     elapsed = time.time() - t0
     msg = body["choices"][0]["message"]
-    pred = (msg.get("content") or "").strip()
-    return {"pred": pred, "elapsed_s": elapsed, "raw": body}
+    raw = (msg.get("content") or "").strip()
+    # The chat template prepends `<think>\n\n</think>\n\n` even when thinking
+    # is disabled (llama.cpp Qwen3.5 quirk). The grammar guarantees the actual
+    # answer is one of PEST_CLASSES somewhere in the string — find it.
+    pred = raw
+    for cls in PEST_CLASSES:
+        if cls in raw:
+            pred = cls
+            break
+    return {"pred": pred, "elapsed_s": elapsed, "raw_content": raw}
 
 
 def main():
