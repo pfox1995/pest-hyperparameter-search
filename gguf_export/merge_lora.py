@@ -124,18 +124,22 @@ def main():
 
     # See module docstring: zero out lora_B on the Gated DeltaNet linear-attn
     # projections before merge. The training-time `target_modules` regex
-    # accidentally matched these (qkv→in_proj_qkv, in_proj_b→in_proj_b, etc.)
-    # — Unsloth defaults to decoupled mode where the fused QKVZ/BA tensors are
-    # already split into 4 separate Linear modules per layer. lora_B starts at
-    # zero on init, so zeroing it makes the merged delta exactly zero — the
-    # base tensor passes through unchanged for these specific layers.
+    # accidentally matched these — Unsloth defaults to decoupled mode where
+    # the fused QKVZ/BA tensors are already split into 4 separate Linear
+    # modules per layer.
     #
-    # NOTE: This is the "salvage existing adapter" path. It loses the LoRA
-    # contribution to ~half the layers (120 of 248 modules). For full accuracy
-    # recovery, retrain with target_modules excluding any "in_proj_*" patterns.
-    rogue_substrings = ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z",
-                        "linear_attn.in_proj_a", "linear_attn.in_proj_b",
-                        "linear_attn.out_proj")
+    # SKIP_ZEROING=1 disables this: produces a "complete" merge with all 248
+    # LoRA modules baked in. Use this when applying the pre-permute trick
+    # (gguf_export/pre_permute_for_gguf.py) so that GGUF conversion's
+    # _reorder_v_heads permutation is undone before inference.
+    skip_zeroing = os.environ.get("SKIP_ZEROING", "0") == "1"
+    rogue_substrings = () if skip_zeroing else (
+        "linear_attn.in_proj_qkv", "linear_attn.in_proj_z",
+        "linear_attn.in_proj_a", "linear_attn.in_proj_b",
+        "linear_attn.out_proj",
+    )
+    if skip_zeroing:
+        print(f"      SKIP_ZEROING=1: NOT zeroing rogue projections — full LoRA merge.")
     zeroed = 0
     for name, module in model.named_modules():
         if any(s in name for s in rogue_substrings) and hasattr(module, "lora_B"):
