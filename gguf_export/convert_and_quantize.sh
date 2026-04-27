@@ -57,7 +57,9 @@ echo "[4/5] Quantizing to Q5_K_M..."
 # (Vision encoder doesn't change with LoRA on language layers — we can
 # reuse Unsloth's official F16 mmproj instead of regenerating it.)
 echo "[5/5] Downloading mmproj vision tower..."
-huggingface-cli download unsloth/Qwen3.5-9B-GGUF mmproj-F16.gguf \
+# `huggingface-cli` was deprecated in huggingface_hub 1.x and now prints
+# help text instead of downloading. Use the new `hf` CLI.
+hf download unsloth/Qwen3.5-9B-GGUF mmproj-F16.gguf \
     --local-dir "${GGUF_DIR}"
 
 echo ""

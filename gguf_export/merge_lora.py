@@ -9,6 +9,32 @@ Why this exists:
     NOT merged. We use peft's `merge_and_unload()` directly, which has been
     verified to work for Qwen vision models.
 
+CRITICAL: Gated DeltaNet rogue-target stripping
+    The training-time LoRA `target_modules` regex (Unsloth default) contains
+    substrings `qkv` and `in_proj_b`, which UNINTENTIONALLY substring-match
+    Qwen3.5's fused Gated DeltaNet projections `linear_attn.in_proj_qkvz` and
+    `linear_attn.in_proj_ba`. PEFT then attaches LoRA to these fused tensors
+    treating them as flat nn.Linear, with no awareness of their internal
+    Q/K/V/Z partition.
+
+    `convert_hf_to_gguf.py:_reorder_v_heads()` later reorders the V-slice rows
+    of `in_proj_qkvz` from grouped-per-K-head layout to tiled layout. Any
+    LoRA delta in the V-slice rows ends up in scrambled head positions →
+    degenerate single-token output ("adgeadgeadge...") in 75% of layers
+    (the linear-attention blocks).
+
+    Fix: zero `lora_B` for any module whose name contains the rogue suffixes
+    BEFORE calling `merge_and_unload()`. This drops the unintended LoRA
+    contribution to the linear-attention blocks while preserving the
+    correctly-placed LoRA on standard q/k/v/o/gate/up/down projections (the
+    25% of layers that are full attention). Output becomes coherent at the
+    cost of any linear-attention adaptation the LoRA had learned (which was
+    accidental anyway).
+
+    Refs:
+      - github.com/ggml-org/llama.cpp/issues/21125 (upstream V-reorder bug)
+      - swift `--linear_decoupled_in_proj true` (the proper training fix)
+
 GPU mode:
     Loads base in FP16 directly to GPU (`device_map="auto"`). Tested target:
     RTX A5000 (24 GB VRAM). The 9B FP16 base is ~18 GB, leaving ~6 GB for
@@ -75,9 +101,9 @@ def main():
 
     print(f"[2/4] Loading base model in FP16 to {device_map}: {base_id}")
     print(f"      (NOT 4-bit — we need full precision weights to merge into)")
-    from transformers import AutoModelForVision2Seq, AutoProcessor
+    from transformers import AutoModelForImageTextToText, AutoProcessor
 
-    base = AutoModelForVision2Seq.from_pretrained(
+    base = AutoModelForImageTextToText.from_pretrained(
         base_id,
         torch_dtype=torch.float16,
         device_map=device_map,
@@ -95,6 +121,31 @@ def main():
         adapter_path,
         torch_dtype=torch.float16,  # prevent FP32 upcast of adapter weights
     )
+
+    # See module docstring: zero out lora_B on the Gated DeltaNet linear-attn
+    # projections before merge. The training-time `target_modules` regex
+    # accidentally matched these (qkv→in_proj_qkv, in_proj_b→in_proj_b, etc.)
+    # — Unsloth defaults to decoupled mode where the fused QKVZ/BA tensors are
+    # already split into 4 separate Linear modules per layer. lora_B starts at
+    # zero on init, so zeroing it makes the merged delta exactly zero — the
+    # base tensor passes through unchanged for these specific layers.
+    #
+    # NOTE: This is the "salvage existing adapter" path. It loses the LoRA
+    # contribution to ~half the layers (120 of 248 modules). For full accuracy
+    # recovery, retrain with target_modules excluding any "in_proj_*" patterns.
+    rogue_substrings = ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z",
+                        "linear_attn.in_proj_a", "linear_attn.in_proj_b",
+                        "linear_attn.out_proj")
+    zeroed = 0
+    for name, module in model.named_modules():
+        if any(s in name for s in rogue_substrings) and hasattr(module, "lora_B"):
+            for adapter_name in module.lora_B:
+                with torch.no_grad():
+                    module.lora_B[adapter_name].weight.zero_()
+                zeroed += 1
+    print(f"      Zeroed lora_B on {zeroed} Gated DeltaNet fused projections "
+          f"(prevents V-head scrambling at GGUF conversion time).")
+
     merged = model.merge_and_unload()  # <- the critical call (NOT save_pretrained_merged)
     merged = merged.to(torch.float16)  # belt-and-suspenders: re-assert FP16 post-merge
     print(f"      Merge complete. LoRA layers now baked into base weights.")
